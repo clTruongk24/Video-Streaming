@@ -109,6 +109,8 @@ class ServerWorker:
 			
 	def sendRtp(self):
 		"""Send RTP packets over UDP."""
+		MAX_RTP_PAYLOAD = 1400
+		
 		while True:
 			self.clientInfo['event'].wait(0.05) 
 			
@@ -122,20 +124,40 @@ class ServerWorker:
 				try:
 					address = self.clientInfo['rtspSocket'][1][0]
 					port = int(self.clientInfo['rtpPort'])
-					self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber),(address,port))
+					
+					# Fragment the frame if it's too large
+					if len(data) > MAX_RTP_PAYLOAD:
+						offset = 0
+						while offset < len(data):
+							# Get the chunk
+							chunk = data[offset:offset + MAX_RTP_PAYLOAD]
+							offset += MAX_RTP_PAYLOAD
+							
+							# Determine if this is the last chunk
+							if offset >= len(data):
+								marker = 1
+							else:
+								marker = 0
+							
+							# Send the packet
+							self.clientInfo['rtpSocket'].sendto(self.makeRtp(chunk, frameNumber, marker),(address,port))
+					else:
+						# Send the whole frame
+						self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber, 1),(address,port))
+						
 				except:
 					print("Connection Error")
 					#print('-'*60)
 					#traceback.print_exc(file=sys.stdout)
 					#print('-'*60)
 
-	def makeRtp(self, payload, frameNbr):
+	def makeRtp(self, payload, frameNbr, marker=0):
 		"""RTP-packetize the video data."""
 		version = 2
 		padding = 0
 		extension = 0
 		cc = 0
-		marker = 0
+		# marker is passed as argument
 		pt = 26 # MJPEG type
 		seqnum = frameNbr
 		ssrc = 0 
