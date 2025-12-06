@@ -96,42 +96,48 @@ class Client:
 	
 	def listenRtp(self):		
 		"""Listen for RTP packets."""
-		# Buffer for assembling a frame and tracker for the current frame
-		self.frameBuffer = bytearray()
-		self.currentFrame = -1
+		self.frameBuffer = bytearray() # Buffer để lưu trữ dữ liệu khung hình
+		self.currentTimestamp = -1
 		
 		while True:
 			try:
 				data = self.rtpSocket.recv(20480)
 				if data:
 					rtpPacket = RtpPacket()
-					rtpPacket.decode(data)
-					
-					currFrameNbr = rtpPacket.seqNum()
-					print("Current Seq Num: " + str(currFrameNbr))
-					# Assemble fragments for the same frame sequence number.
-					# `self.frameNbr` is the last delivered frame number.
-					if currFrameNbr > self.frameNbr:
-						# If this is the first fragment we see for this frame,
-						# start a fresh buffer.
-						if currFrameNbr != self.currentFrame:
-							self.currentFrame = currFrameNbr
-							self.frameBuffer = bytearray()
-						# Append payload (works for fragmented or single-packet frames)
-						self.frameBuffer.extend(rtpPacket.getPayload())
-						# If marker bit set, this is the last fragment: deliver frame
-						if rtpPacket.marker() == 1:
-							self.updateMovie(self.writeFrame(self.frameBuffer))
-							self.frameNbr = currFrameNbr
-							self.currentFrame = -1
-							self.frameBuffer = bytearray()
+					rtpPacket.decode(data) # Giải mã gói RTP nhận được (Lấy dữ liệu vào rtpPacket.header và rtpPacket.payload)
+
+					seq = rtpPacket.seqNum()
+					timestamp = rtpPacket.timestamp() # Cũng là số thứ tự khung hình (frame number)
+					marker = rtpPacket.marker() # Lấy thông tin marker bit để xem đây có phải gói cuối cùng của khung hình hay không
+
+					print(f"Seq={seq}  Timestamp={timestamp}  Marker={marker}")
+					# Nếu đây là frame mới thì ta reset buffer
+					if timestamp != self.currentTimestamp:
+						self.currentTimestamp = timestamp
+						self.frameBuffer = bytearray()
+
+					# Thêm payload vào buffer
+					self.frameBuffer.extend(rtpPacket.getPayload())
+
+					# Nếu marker bit = 1 thì đây là gói cuối cùng của frame
+					if marker == 1:
+                    	# Cập nhật current frame index
+						self.frameNbr = timestamp
+
+                    	# Render
+						self.updateMovie(self.writeFrame(self.frameBuffer))
+
+                    	# Reset để nhận frame kế
+						self.currentTimestamp = -1
+						self.frameBuffer = bytearray()
+
 			except:
 				# Stop listening upon requesting PAUSE or TEARDOWN
-				if self.playEvent.isSet(): 
+				if self.playEvent.is_set(): 
 					break
 				
 				# Upon receiving ACK for TEARDOWN request,
-				# close the RTP socket
+				# Close the RTP socket
 				if self.teardownAcked == 1:
 					self.rtpSocket.shutdown(socket.SHUT_RDWR)
 					self.rtpSocket.close()
@@ -139,15 +145,18 @@ class Client:
 					
 	def writeFrame(self, data):
 		"""Write the received frame to a temp image file. Return the image file."""
+		# Tạo ra tên tệp tin cache dựa trên sessionId
 		cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
+		# Ghi dữ liệu khung hình vào tệp tin
 		file = open(cachename, "wb")
 		file.write(data)
 		file.close()
-		
+		# Trả về tên tệp tin cache
 		return cachename
 	
 	def updateMovie(self, imageFile):
 		"""Update the image file as video frame in the GUI."""
+		# Tạo biến photo với thông tin hình ảnh từ tệp tin imageFile(=tệp tin cache)
 		photo = ImageTk.PhotoImage(Image.open(imageFile))
 		self.label.configure(image = photo, height=288) 
 		self.label.image = photo

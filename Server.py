@@ -12,7 +12,7 @@ class Server:
 			sys.exit()
 		rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		rtspSocket.bind(('', SERVER_PORT))
-		rtspSocket.listen(5)        
+		rtspSocket.listen(5) # Listen for up to 5 clients
 
 		# Receive client info (address,port) through RTSP/TCP session
 		while True:
