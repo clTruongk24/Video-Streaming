@@ -153,13 +153,39 @@ class Client:
 		file.close()
 		# Trả về tên tệp tin cache
 		return cachename
-	
+	#Sửa để stream video HD
 	def updateMovie(self, imageFile):
 		"""Update the image file as video frame in the GUI."""
 		# Tạo biến photo với thông tin hình ảnh từ tệp tin imageFile(=tệp tin cache)
-		photo = ImageTk.PhotoImage(Image.open(imageFile))
-		self.label.configure(image = photo, height=288) 
+	
+		# photo = ImageTk.PhotoImage(Image.open(imageFile))
+		# self.label.configure(image = photo, height=288) 
+		# self.label.image = photo
+
+		#Mở hình jpeg
+		img = Image.open(imageFile)
+
+		original_width, original_height = img.size #Kích thước của hình gốc
+
+		target_height = 360 #Chiều dài mong muốn
+
+		aspect_ratio = original_width / original_height # Tỷ lệ của hình gốc
+		target_width = int(target_height * aspect_ratio) #Chiểu rổng mong muốn 
+
+		photo = ImageTk.PhotoImage(img)
+
+		if target_height < original_height: #Nếu chiều dài hình lớn hơn mong muốn thì resize, scale hình có chất lượng tốt
+			img_resized = img.resize((target_width, target_height), Image.LANCZOS)
+			photo = ImageTk.PhotoImage(img_resized)
+		else:
+			target_width = original_width
+			target_height = original_height
+			
+
+		self.label.configure(image = photo, width=target_width, height=target_height)
 		self.label.image = photo
+		
+		
 		
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""
