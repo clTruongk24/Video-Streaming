@@ -1,9 +1,10 @@
 from tkinter import *
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
-import socket, threading, sys, traceback, os
+import socket, threading, sys, traceback, os, time
 
 from RtpPacket import RtpPacket
+from collections import deque
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
@@ -18,6 +19,8 @@ class Client:
 	PLAY = 1
 	PAUSE = 2
 	TEARDOWN = 3
+
+	MAX_CACHE_FRAME_SIZE = 10
 	
 	# Initiation..
 	def __init__(self, master, serveraddr, serverport, rtpport, filename):
@@ -74,6 +77,9 @@ class Client:
 	def exitClient(self):
 		"""Teardown button handler."""
 		self.sendRtspRequest(self.TEARDOWN)		
+		
+		if hasattr(self, 'playbackStop'):
+			self.playbackStop.set()
 		self.master.destroy() # Close the gui window
 		try:
 			os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
@@ -84,6 +90,8 @@ class Client:
 		"""Pause button handler."""
 		if self.state == self.PLAYING:
 			self.sendRtspRequest(self.PAUSE)
+			if hasattr(self, 'playbackStop'):
+				self.playbackStop.set()
 	
 	def playMovie(self):
 		"""Play button handler."""
@@ -98,50 +106,115 @@ class Client:
 		"""Listen for RTP packets."""
 		self.frameBuffer = bytearray() # Buffer để lưu trữ dữ liệu khung hình
 		self.currentTimestamp = -1
-		
-		while True:
+
+		self.playbackBuffer = deque(maxlen = self.MAX_CACHE_FRAME_SIZE) #Buffer cho caching sử dụng queue
+		self.playbackStop = threading.Event()
+		threading.Thread(target=self._playbackLoop).start()
+
+		self.rtpSocket.settimeout(0.5)
+
+		while not self.playbackStop.is_set():
 			try:
-				data = self.rtpSocket.recv(20480)
-				if data:
-					rtpPacket = RtpPacket()
-					rtpPacket.decode(data) # Giải mã gói RTP nhận được (Lấy dữ liệu vào rtpPacket.header và rtpPacket.payload)
-
-					seq = rtpPacket.seqNum()
-					timestamp = rtpPacket.timestamp() # Cũng là số thứ tự khung hình (frame number)
-					marker = rtpPacket.marker() # Lấy thông tin marker bit để xem đây có phải gói cuối cùng của khung hình hay không
-
-					print(f"Seq={seq}  Timestamp={timestamp}  Marker={marker}")
-					# Nếu đây là frame mới thì ta reset buffer
-					if timestamp != self.currentTimestamp:
-						self.currentTimestamp = timestamp
-						self.frameBuffer = bytearray()
-
-					# Thêm payload vào buffer
-					self.frameBuffer.extend(rtpPacket.getPayload())
-
-					# Nếu marker bit = 1 thì đây là gói cuối cùng của frame
-					if marker == 1:
-                    	# Cập nhật current frame index
-						self.frameNbr = timestamp
-
-                    	# Render
-						self.updateMovie(self.writeFrame(self.frameBuffer))
-
-                    	# Reset để nhận frame kế
-						self.currentTimestamp = -1
-						self.frameBuffer = bytearray()
-
-			except:
-				# Stop listening upon requesting PAUSE or TEARDOWN
-				if self.playEvent.is_set(): 
-					break
-				
-				# Upon receiving ACK for TEARDOWN request,
-				# Close the RTP socket
+				data = self.rtpSocket.recv(20480) #Nhận gói từ Server
+			except socket.timeout:
+				continue
+			except Exception:
 				if self.teardownAcked == 1:
 					self.rtpSocket.shutdown(socket.SHUT_RDWR)
 					self.rtpSocket.close()
-					break
+				break
+
+			
+			rtpPacket = RtpPacket()
+			rtpPacket.decode(data)# Giải mã gói RTP nhận được (Lấy dữ liệu vào rtpPacket.header và rtpPacket.payload)
+ 
+			timestamp = rtpPacket.timestamp()  # Cũng là số thứ tự khung hình (frame number)
+			marker = rtpPacket.marker() # Lấy thông tin marker bit để xem đây có phải gói cuối cùng của khung hình hay không
+			payload = rtpPacket.getPayload()
+
+			# Nếu đây là frame mới thì ta reset buffer
+			if self.currentTimestamp != timestamp:
+				self.currentTimestamp = timestamp
+				self.frameBuffer = bytearray()
+
+			# Thêm payload vào buffer
+			self.frameBuffer.extend(rtpPacket.getPayload())
+
+			# Nếu marker bit = 1 thì đây là gói cuối cùng của frame
+			if marker == 1:
+				#gộp buffer lại thành frame
+				imageFile = self.writeFrame(self.frameBuffer)
+				#thêm frame vào buffer cho caching
+				self.playbackBuffer.append(imageFile)
+				#reset Buffer để nhận frame kế tiếp
+				self.frameBuffer = bytearray()
+			
+
+		
+		# while True:
+		# 	try:
+		# 		data = self.rtpSocket.recv(20480)
+		# 		if data:
+		# 			rtpPacket = RtpPacket()
+		# 			rtpPacket.decode(data) # Giải mã gói RTP nhận được (Lấy dữ liệu vào rtpPacket.header và rtpPacket.payload)
+
+		# 			seq = rtpPacket.seqNum()
+		# 			timestamp = rtpPacket.timestamp() # Cũng là số thứ tự khung hình (frame number)
+		# 			marker = rtpPacket.marker() # Lấy thông tin marker bit để xem đây có phải gói cuối cùng của khung hình hay không
+
+		# 			print(f"Seq={seq}  Timestamp={timestamp}  Marker={marker}")
+		# 			# Nếu đây là frame mới thì ta reset buffer
+		# 			if timestamp != self.currentTimestamp:
+		# 				self.currentTimestamp = timestamp
+		# 				self.frameBuffer = bytearray()
+
+		# 			# Thêm payload vào buffer
+		# 			self.frameBuffer.extend(rtpPacket.getPayload())
+
+		# 			# Nếu marker bit = 1 thì đây là gói cuối cùng của frame
+		# 			if marker == 1:
+        #             	# Cập nhật current frame index
+		# 				self.frameNbr = timestamp
+
+        #             	# Render
+		# 				self.updateMovie(self.writeFrame(self.frameBuffer))
+
+        #             	# Reset để nhận frame kế
+		# 				self.currentTimestamp = -1
+		# 				self.frameBuffer = bytearray()
+
+		# 	except:
+		# 		# Stop listening upon requesting PAUSE or TEARDOWN
+		# 		if self.playEvent.is_set(): 
+		# 			break
+				
+		# 		# Upon receiving ACK for TEARDOWN request,
+		# 		# Close the RTP socket
+		# 		if self.teardownAcked == 1:
+		# 			self.rtpSocket.shutdown(socket.SHUT_RDWR)
+		# 			self.rtpSocket.close()
+		# 			break
+
+	def _playbackLoop(self):
+		"""Playback from buffer"""
+		target_fps = 20 #fps mong muốn không quá lớn
+		frame_interval = 1.0 / target_fps #Khoảng cách thời gian giữa các frame(s)
+		last_time = time.time() #Thời điểm frame cuối cùng
+
+		while not self.playbackStop.is_set():
+			now = time.time()
+			if now - last_time < frame_interval: #Đảm bảo thời gian đồng đều giữa các frame
+				time.sleep(frame_interval - (now - last_time))
+			last_time = time.time()
+
+			if len(self.playbackBuffer) > 0: #kiểm tra có frame nào không
+				try:
+					imageFile = self.playbackBuffer.popleft()
+					self.updateMovie(imageFile)
+				except Exception as e:
+					print(f"Playback error: {e}")
+			else:
+				time.sleep(0.1) #Đợi đến khi có frame trong buffer
 					
 	def writeFrame(self, data):
 		"""Write the received frame to a temp image file. Return the image file."""
@@ -167,7 +240,7 @@ class Client:
 
 		original_width, original_height = img.size #Kích thước của hình gốc
 
-		target_height = 360 #Chiều dài mong muốn
+		target_height = 480 #Chiều dài mong muốn
 
 		aspect_ratio = original_width / original_height # Tỷ lệ của hình gốc
 		target_width = int(target_height * aspect_ratio) #Chiểu rổng mong muốn 
