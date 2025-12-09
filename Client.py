@@ -143,9 +143,8 @@ class Client:
 			# Nếu marker bit = 1 thì đây là gói cuối cùng của frame
 			if marker == 1:
 				#gộp buffer lại thành frame
-				imageFile = self.writeFrame(self.frameBuffer)
 				#thêm frame vào buffer cho caching
-				self.playbackBuffer.append(imageFile)
+				self.playbackBuffer.append(self.frameBuffer)
 				#reset Buffer để nhận frame kế tiếp
 				self.frameBuffer = bytearray()
 			
@@ -209,7 +208,8 @@ class Client:
 
 			if len(self.playbackBuffer) > 0: #kiểm tra có frame nào không
 				try:
-					imageFile = self.playbackBuffer.popleft()
+					frame = self.playbackBuffer.popleft()
+					imageFile = self.writeFrame(frame)
 					self.updateMovie(imageFile)
 				except Exception as e:
 					print(f"Playback error: {e}")
