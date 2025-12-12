@@ -195,7 +195,8 @@ class Client:
 				if self.playbackBuffer:
 					frame = self.playbackBuffer.popleft()
 					try:
-						self.updateMovie(frame)
+						imageFile = self.writeFrame(frame)
+						self.updateMovie(imageFile)
 						frames_played += 1
 						if frames_played % 30 == 0:
 							print(f"[Playback from buffer] Frames: {frames_played}, Buffer còn: {len(self.playbackBuffer)}")
