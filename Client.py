@@ -1,10 +1,9 @@
 from tkinter import *
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
-import socket, threading, sys, traceback, os, time, io
+import socket, threading, time, io, os
 
 from RtpPacket import RtpPacket
-# THAY ĐỔI: Loại bỏ defaultdict - không cần nữa vì giả sử packets đúng thứ tự
 from collections import deque
 
 CACHE_FILE_NAME = "cache-"
@@ -15,20 +14,16 @@ class Client:
 	READY = 1
 	PLAYING = 2
 	state = INIT
-	
 	SETUP = 0
 	PLAY = 1
 	PAUSE = 2
 	TEARDOWN = 3
 
-	# ==========================================================================
-	# CẤU HÌNH STREAMING - MỚI: Thêm các tham số điều khiển buffer và FPS
-	# ==========================================================================
-	TARGET_FPS = 60                    # FPS mục tiêu khi phát video
-	MAX_CACHE_FRAME_SIZE = 400         # MỚI: Buffer lớn hơn (3 giây ở 60fps)
-	MIN_BUFFER_BEFORE_PLAY = 30        # MỚI: Pre-buffer 30 frames trước khi phát
-	LOW_BUFFER_THRESHOLD = 15          # MỚI: Giảm FPS khi buffer < 15
-	CRITICAL_BUFFER_THRESHOLD = 5      # MỚI: Tạm dừng khi buffer < 5
+	# CẤU HÌNH STREAMING
+	TARGET_FPS = 20                    # FPS mục tiêu khi phát video
+	MIN_BUFFER_BEFORE_PLAY = 30        # Pre-buffer 30 frames trước khi phát
+	MAX_BUFFER_SIZE = 300              # Buffer tối đa - tạm dừng nhận khi đạt
+	MIN_BUFFER_TO_RESUME = 100         # Buffer tối thiểu để tiếp tục nhận
 	
 	def __init__(self, master, serveraddr, serverport, rtpport, filename):
 		self.master = master
@@ -43,7 +38,16 @@ class Client:
 		self.requestSent = -1
 		self.teardownAcked = 0
 		self.connectToServer()
-		self.frameNbr = 0
+
+		self.playbackBuffer = deque()  # Chứa các frame hoàn chỉnh để phát
+		self.bufferLock = threading.Lock()
+		self.eosReceived = False
+		self.framesReceived = 0
+		self.bufferReady = threading.Event()
+		self.playbackStop = threading.Event()
+		self.playEvent = threading.Event()
+		self.bufferPaused = False  # Cờ tạm dừng nhận khi buffer đầy
+
 		
 	def createWidgets(self):
 		"""Build GUI."""
@@ -72,24 +76,40 @@ class Client:
 		self.teardown.grid(row=1, column=3, padx=2, pady=2)
 		
 		# Create a label to display the movie - KHÔNG đặt height cố định
-		self.label = Label(self.master, bg='black')
+		self.label = Label(self.master)
 		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5)
-		
-		# Cho phép row 0 (video) co giãn
-		self.master.grid_rowconfigure(0, weight=1)
-		self.master.grid_columnconfigure(0, weight=1) 
+
 	
 	def setupMovie(self):
 		"""Setup button handler."""
 		if self.state == self.INIT:
+			self.eosReceived = False  # Reset EOS flag
+			self.playbackBuffer.clear()  # Reset playback buffer
+			self.framesReceived = 0   # Reset frame counter
+			self.bufferReady.clear()  # Reset buffer ready event
+			self.playbackStop.clear() # Reset playback stop event
+			self.bufferPaused = False # Reset buffer pause flag
 			self.sendRtspRequest(self.SETUP)
 	
 	def exitClient(self):
 		"""Teardown button handler."""
 		self.sendRtspRequest(self.TEARDOWN)		
 		
+		# Dừng tất cả các threads
 		if hasattr(self, 'playbackStop'):
 			self.playbackStop.set()
+		if hasattr(self, 'playEvent'):
+			self.playEvent.set()
+		if hasattr(self, 'bufferReady'):
+			self.bufferReady.set()  # Unblock waiting threads
+		
+		# Đóng RTP socket để unblock recvfrom
+		if hasattr(self, 'rtpSocket'):
+			try:
+				self.rtpSocket.close()
+			except:
+				pass
+				
 		self.master.destroy() # Close the gui window
 		try:
 			os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
@@ -99,49 +119,96 @@ class Client:
 	def pauseMovie(self):
 		"""Pause button handler."""
 		if self.state == self.PLAYING:
-			self.sendRtspRequest(self.PAUSE)
-			if hasattr(self, 'playbackStop'):
-				self.playbackStop.set()
+			# Nếu đã nhận EOS (server đã dừng), chỉ cần dừng playback ở client
+			# Không cần gửi PAUSE request vì server đã không còn gửi data
+			if not self.eosReceived:
+				self.sendRtspRequest(self.PAUSE)
+			else:
+				# Dừng playback thread và chuyển về READY
+				self.state = self.READY
+				if hasattr(self, 'playEvent'):
+					self.playEvent.set()
+				print(f"[Client] Paused locally (server đã hết video)")
+				
+			with self.bufferLock:
+				print(f"[Client] Paused. Buffer còn {len(self.playbackBuffer)} frames")
 	
 	def playMovie(self):
 		"""Play button handler."""
-		if self.state == self.READY:
-			# Khởi tạo buffer
-			self.playbackBuffer = deque(maxlen=self.MAX_CACHE_FRAME_SIZE)
-			self.bufferReady = threading.Event()
-			self.bufferReady.clear()
-			self.playbackStop = threading.Event()
-			self.framesReceived = 0
+		if self.state == self.READY or self.state == self.PLAYING:
+			# Kiểm tra buffer hiện tại trước
+			with self.bufferLock:
+				currentBuffer = len(self.playbackBuffer)
 			
-			# Bắt đầu lắng nghe RTP
-			threading.Thread(target=self.listenRtp, daemon=True).start()
+			# Nếu đã nhận EOS (server hết video)
+			if self.eosReceived:
+				if currentBuffer > 0:
+					# Còn frames trong buffer -> phát những gì còn lại
+					print(f"[Client] Server đã hết video, phát {currentBuffer} frames còn trong buffer")
+					# Chuyển sang PLAYING để playback thread chạy
+					self.state = self.PLAYING
+					if not hasattr(self, 'playbackThread') or not self.playbackThread.is_alive():
+						self.playbackThread = threading.Thread(target=self.playbackFromBuffer)
+						self.playbackThread.start()
+				else:
+					# Buffer rỗng và server đã hết video -> thông báo
+					print(f"[Client] Video đã kết thúc, không còn frame nào trong buffer")
+				return  # KHÔNG gửi PLAY request khi đã EOS
 			
-			self.playEvent = threading.Event()
-			self.playEvent.clear()
+			# Nếu buffer đủ -> phát ngay, không cần chờ thêm
+			if currentBuffer >= self.MIN_BUFFER_BEFORE_PLAY:
+				print(f"[Client] Buffer đủ ({currentBuffer} frames), bắt đầu phát...")
+				self.sendRtspRequest(self.PLAY)
+				if not hasattr(self, 'playbackThread') or not self.playbackThread.is_alive():
+					self.playbackThread = threading.Thread(target=self.playbackFromBuffer)
+					self.playbackThread.start()
+				return
+				
+			# Gửi PLAY request (chỉ khi chưa EOS)
 			self.sendRtspRequest(self.PLAY)
-			
-			print(f"[Client] Đang buffer... cần {self.MIN_BUFFER_BEFORE_PLAY} frames trước khi phát")
+			print(f"[Client] Đang chờ buffer đủ {self.MIN_BUFFER_BEFORE_PLAY} frames")
 	
+	def playbackFromBuffer(self):
+		"""Phát video từ buffer - dùng khi server đã hết video."""
+		base_fps = 30  # FPS khi phát từ buffer còn lại
+		frames_played = 0
+		
+		print(f"[Playback from buffer] Bắt đầu phát ở {base_fps} FPS")
+		
+		while self.state == self.PLAYING:
+			with self.bufferLock:
+				bufferSize = len(self.playbackBuffer)
+				
+			# Nếu buffer rỗng và đã nhận EOS -> kết thúc
+			if bufferSize == 0 and self.eosReceived:
+				print("[Client] Đã phát hết video")
+				self.state = self.READY
+				break
+				
+			# Nếu buffer rỗng nhưng chưa EOS -> chờ thêm data
+			if bufferSize == 0:
+				time.sleep(0.01)
+				continue
+				
+			# Lấy frame từ buffer và hiển thị
+			with self.bufferLock:
+				if self.playbackBuffer:
+					frame = self.playbackBuffer.popleft()
+					try:
+						self.updateMovie(frame)
+						frames_played += 1
+						if frames_played % 30 == 0:
+							print(f"[Playback from buffer] Frames: {frames_played}, Buffer còn: {len(self.playbackBuffer)}")
+					except Exception as e:
+						print(f"[Playback error] {e}")
+					
+			time.sleep(1 / base_fps)
+		
+		print(f"[Playback from buffer] Đã phát {frames_played} frames")
+
 	def listenRtp(self):		
-		"""
-		Lắng nghe RTP packets - PHIÊN BẢN ĐƠN GIẢN HÓA.
-		
-		THAY ĐỔI SO VỚI TRƯỚC:
-		- TRƯỚC: Sử dụng packetBuffer (defaultdict) để lưu packets theo timestamp/seqNum
-		         Có _tryAssembleFrame() sắp xếp lại packets
-		         Có _processCompletedFrames() xử lý timeout
-		         Có _isValidJpeg() validate JPEG data
-		- SAU:   Giả sử packets luôn đến đúng thứ tự và đầy đủ
-		         Chỉ cần ghép payload theo marker bit
-		         Code đơn giản hơn ~50%
-		
-		Cơ chế hoạt động:
-		1. Nhận packet RTP từ server
-		2. Nếu timestamp mới → bắt đầu frame mới
-		3. Ghép payload vào frameBuffer
-		4. Nếu marker=1 → frame hoàn chỉnh → đẩy vào playbackBuffer
-		"""
-		self.frameBuffer = bytearray()  # Buffer tích lũy payload của frame hiện tại
+		"""Listen for RTP packets"""
+		self._frameAssemblyBuffer = bytearray()  # Buffer tích lũy payload của frame hiện tại
 		self.currentTimestamp = -1      # Timestamp của frame đang nhận
 		
 		# MỚI: Đợi buffer đủ rồi mới start playback (pre-buffering)
@@ -149,53 +216,84 @@ class Client:
 
 		self.rtpSocket.settimeout(0.1)  # Timeout ngắn để responsive
 
-		while not self.playbackStop.is_set():
-			try:
-				data = self.rtpSocket.recv(65535)
-			except socket.timeout:
-				continue
-			except Exception:
-				if self.teardownAcked == 1:
-					try:
-						self.rtpSocket.shutdown(socket.SHUT_RDWR)
-						self.rtpSocket.close()
-					except:
-						pass
+		while True:
+			# Kiểm tra điều kiện thoát
+			if self.teardownAcked == 1 or self.playEvent.is_set():
+				print("[Client] RTP listener stopped")
 				break
-
-			# Decode RTP packet
-			rtpPacket = RtpPacket()
-			rtpPacket.decode(data)
- 
-			timestamp = rtpPacket.timestamp()
-			marker = rtpPacket.marker()
-			payload = rtpPacket.getPayload()
-
-			# Nếu timestamp mới → frame mới → reset buffer
-			if timestamp != self.currentTimestamp:
-				self.currentTimestamp = timestamp
-				self.frameBuffer = bytearray()
-
-			# Thêm payload vào buffer
-			self.frameBuffer.extend(payload)
-
-			# Marker = 1 → packet cuối của frame → frame hoàn chỉnh
-			if marker == 1:
-				# Thêm frame vào playback buffer
-				self.playbackBuffer.append(bytes(self.frameBuffer))
-				self.framesReceived += 1
 				
-				# Kiểm tra đã đủ buffer chưa
-				if not self.bufferReady.is_set() and len(self.playbackBuffer) >= self.MIN_BUFFER_BEFORE_PLAY:
-					print(f"[Client] Buffer đủ! Bắt đầu phát video...")
-					self.bufferReady.set()
-				
-				# Log tiến trình
-				if self.framesReceived % 60 == 0:
-					print(f"[Client] Đã nhận {self.framesReceived} frames, buffer: {len(self.playbackBuffer)}")
-				
-				# Reset frame buffer
-				self.frameBuffer = bytearray()
+			try:
+				data, addr = self.rtpSocket.recvfrom(65535)
+				if data:
+					rtpPacket = RtpPacket()
+					rtpPacket.decode(data)
+					
+					# Kiểm tra marker bit hoặc payload rỗng = EOS
+					payload = rtpPacket.getPayload()
+					if len(payload) == 0:
+						print("[Client] Nhận được tín hiệu End-of-Stream từ server")
+						self.eosReceived = True
+						continue
+						
+					timestamp = rtpPacket.timestamp()
+					marker = rtpPacket.marker()
+					
+					# Nếu timestamp mới → frame mới → reset buffer
+					if timestamp != self.currentTimestamp:
+						self.currentTimestamp = timestamp
+						self._frameAssemblyBuffer = bytearray()
+
+					# Thêm payload vào buffer
+					self._frameAssemblyBuffer.extend(payload)
+
+					# Marker = 1 → packet cuối của frame → frame hoàn chỉnh
+					if marker == 1:
+						# Thêm frame vào playback buffer (thread-safe)
+						with self.bufferLock:
+							buffer_size = len(self.playbackBuffer)
+							
+							# Kiểm tra buffer đầy -> tạm dừng nhận
+							if buffer_size >= self.MAX_BUFFER_SIZE:
+								if not self.bufferPaused:
+									self.bufferPaused = True
+									print(f"[Client] Buffer đầy ({buffer_size} frames), tạm dừng nhận...")
+								# Không thêm frame mới khi buffer đầy
+								self._frameAssemblyBuffer = bytearray()
+								continue
+							
+							# Kiểm tra buffer đã giảm xuống -> tiếp tục nhận
+							if self.bufferPaused and buffer_size <= self.MIN_BUFFER_TO_RESUME:
+								self.bufferPaused = False
+								print(f"[Client] Buffer giảm xuống {buffer_size}, tiếp tục nhận...")
+							
+							# Thêm frame vào buffer nếu không bị pause
+							if not self.bufferPaused:
+								self.playbackBuffer.append(bytes(self._frameAssemblyBuffer))
+								self.framesReceived += 1
+						
+						# Kiểm tra đã đủ buffer chưa để bắt đầu phát
+						if not self.bufferReady.is_set() and len(self.playbackBuffer) >= self.MIN_BUFFER_BEFORE_PLAY:
+							print(f"[Client] Buffer đủ! Bắt đầu phát video...")
+							self.bufferReady.set()
+						
+						# Log tiến trình
+						if self.framesReceived % 60 == 0:
+							print(f"[Client] Đã nhận {self.framesReceived} frames, buffer: {len(self.playbackBuffer)}")
+						
+						# Reset frame buffer
+						self._frameAssemblyBuffer = bytearray()
+			except socket.timeout:
+				# Timeout khi chờ data - tiếp tục vòng lặp
+				continue
+			except OSError:
+				# Socket đã đóng
+				break
+			except Exception as e:
+				# Lỗi khác - kiểm tra teardown
+				if self.teardownAcked == 1:
+					break
+				if self.playEvent.is_set():
+					break
 	
 	def _waitAndStartPlayback(self):
 		"""Đợi buffer đủ rồi mới bắt đầu playback."""
@@ -210,52 +308,6 @@ class Client:
 		
 		if not self.playbackStop.is_set():
 			self._playbackLoop()
-			
-
-		
-		# while True:
-		# 	try:
-		# 		data = self.rtpSocket.recv(20480)
-		# 		if data:
-		# 			rtpPacket = RtpPacket()
-		# 			rtpPacket.decode(data) # Giải mã gói RTP nhận được (Lấy dữ liệu vào rtpPacket.header và rtpPacket.payload)
-
-		# 			seq = rtpPacket.seqNum()
-		# 			timestamp = rtpPacket.timestamp() # Cũng là số thứ tự khung hình (frame number)
-		# 			marker = rtpPacket.marker() # Lấy thông tin marker bit để xem đây có phải gói cuối cùng của khung hình hay không
-
-		# 			print(f"Seq={seq}  Timestamp={timestamp}  Marker={marker}")
-		# 			# Nếu đây là frame mới thì ta reset buffer
-		# 			if timestamp != self.currentTimestamp:
-		# 				self.currentTimestamp = timestamp
-		# 				self.frameBuffer = bytearray()
-
-		# 			# Thêm payload vào buffer
-		# 			self.frameBuffer.extend(rtpPacket.getPayload())
-
-		# 			# Nếu marker bit = 1 thì đây là gói cuối cùng của frame
-		# 			if marker == 1:
-        #             	# Cập nhật current frame index
-		# 				self.frameNbr = timestamp
-
-        #             	# Render
-		# 				self.updateMovie(self.writeFrame(self.frameBuffer))
-
-        #             	# Reset để nhận frame kế
-		# 				self.currentTimestamp = -1
-		# 				self.frameBuffer = bytearray()
-
-		# 	except:
-		# 		# Stop listening upon requesting PAUSE or TEARDOWN
-		# 		if self.playEvent.is_set(): 
-		# 			break
-				
-		# 		# Upon receiving ACK for TEARDOWN request,
-		# 		# Close the RTP socket
-		# 		if self.teardownAcked == 1:
-		# 			self.rtpSocket.shutdown(socket.SHUT_RDWR)
-		# 			self.rtpSocket.close()
-		# 			break
 
 	def _playbackLoop(self):
 		base_fps = self.TARGET_FPS  # FPS mục tiêu (30)
@@ -265,9 +317,15 @@ class Client:
 		
 		print(f"[Playback] Bắt đầu phát ở {base_fps} FPS")
 
-		while not self.playbackStop.is_set():
+		while not self.playbackStop.is_set() and not self.playEvent.is_set():
 			buffer_level = len(self.playbackBuffer)
 			frame_interval = 1.0 / base_fps
+			
+			# Nếu buffer rỗng và đã EOS -> kết thúc playback
+			if buffer_level == 0 and self.eosReceived:
+				print(f"[Playback] Video kết thúc. Đã phát {frames_played} frames")
+				self.state = self.READY
+				break
 			
 			# Đảm bảo timing chính xác
 			now = time.time()
@@ -287,48 +345,51 @@ class Client:
 					if frames_played % base_fps == 0:
 						actual_time = time.time() - start_time
 						actual_fps = frames_played / actual_time if actual_time > 0 else 0
-						print(f"[Playback] Frames: {frames_played}, Buffer: {buffer_level}, FPS thực tế: {actual_fps:.1f}, FPS hiện tại: {base_fps}")
+						#print(f"[Playback] Frames: {frames_played}, Buffer: {buffer_level}, FPS thực tế: {actual_fps:.1f}, FPS hiện tại: {base_fps}")
 				except Exception as e:
 					print(f"Playback error: {e}")
 					
 	def writeFrame(self, data):
-		"""Write frame directly from memory, no file needed."""
-		return data
+		"""Write the received frame to a temp image file. Return the image file."""
+		# Tạo ra tên tệp tin cache dựa trên sessionId
+		cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
+		# Ghi dữ liệu khung hình vào tệp tin
+		file = open(cachename, "wb")
+		file.write(data)
+		file.close()
+		# Trả về tên tệp tin cache
+		return cachename
+	#Sửa để stream video HD
+	def updateMovie(self, imageFile):
+		"""Update the image file as video frame in the GUI."""
+		# Tạo biến photo với thông tin hình ảnh từ tệp tin imageFile(=tệp tin cache)
 	
-	def updateMovie(self, frameData):
-		"""Update video frame in GUI - resize chất lượng cao."""
-		try:
-			# Load JPEG trực tiếp từ memory
-			img = Image.open(io.BytesIO(frameData))
+		# photo = ImageTk.PhotoImage(Image.open(imageFile))
+		# self.label.configure(image = photo, height=288) 
+		# self.label.image = photo
+
+		#Mở hình jpeg
+		img = Image.open(imageFile)
+
+		original_width, original_height = img.size #Kích thước của hình gốc
+
+		target_height = 480 #Chiều dài mong muốn
+
+		aspect_ratio = original_width / original_height # Tỷ lệ của hình gốc
+		target_width = int(target_height * aspect_ratio) #Chiểu rổng mong muốn 
+
+		photo = ImageTk.PhotoImage(img)
+
+		if target_height < original_height: #Nếu chiều dài hình lớn hơn mong muốn thì resize, scale hình có chất lượng tốt
+			img_resized = img.resize((target_width, target_height), Image.LANCZOS)
+			photo = ImageTk.PhotoImage(img_resized)
+		else:
+			target_width = original_width
+			target_height = original_height
 			
-			original_width, original_height = img.size
-			
-			# Kích thước hiển thị mong muốn (có thể thay đổi)
-			MAX_DISPLAY_HEIGHT = 480  # 720p
-			
-			if original_height > MAX_DISPLAY_HEIGHT:
-				# Tính kích thước mới giữ tỷ lệ
-				scale = MAX_DISPLAY_HEIGHT / original_height
-				new_width = int(original_width * scale)
-				new_height = MAX_DISPLAY_HEIGHT
-				
-				# Resize với LANCZOS (chất lượng cao nhất)
-				# Dùng Image.Resampling.LANCZOS cho Pillow mới
-				try:
-					img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-				except AttributeError:
-					# Pillow cũ dùng Image.LANCZOS
-					img = img.resize((new_width, new_height), Image.LANCZOS)
-			
-			# Convert sang PhotoImage
-			photo = ImageTk.PhotoImage(img)
-			
-			# Update label
-			self.label.configure(image=photo)
-			self.label.image = photo  # Keep reference
-			
-		except Exception as e:
-			pass
+
+		self.label.configure(image = photo, width=target_width, height=target_height)
+		self.label.image = photo
 		
 		
 		
@@ -432,6 +493,12 @@ class Client:
 						self.openRtpPort() 
 					elif self.requestSent == self.PLAY:
 						self.state = self.PLAYING
+						
+						# Start RTP receiving thread nếu chưa chạy
+						if not hasattr(self, 'rtpThread') or not self.rtpThread.is_alive():
+							self.playEvent.clear()
+							self.rtpThread = threading.Thread(target=self.listenRtp)
+							self.rtpThread.start()
 					elif self.requestSent == self.PAUSE:
 						self.state = self.READY
 						

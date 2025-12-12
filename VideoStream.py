@@ -1,31 +1,3 @@
-""" 
-=============================================================================
-VideoStream.py - MJPEG Video File Reader
-=============================================================================
-
-CÁC THAY ĐỔI SO VỚI PHIÊN BẢN TRƯỚC:
-
-1. CẢI TIẾN readRawFrame():
-   - TRƯỚC: Đọc toàn bộ file còn lại vào RAM, tính sai vị trí file pointer
-   - SAU:   Đọc theo chunk 64KB, lưu start_pos trước khi đọc,
-            tính đúng vị trí seek sau khi extract frame
-
-2. CẢI TIẾN detectFormat():
-   - Thêm kiểm tra RAW MJPEG (bắt đầu trực tiếp bằng SOI marker)
-   - Cải thiện phát hiện CUSTOM format (ASCII length prefix)
-
-3. THÊM validateJpeg():
-   - Kiểm tra SOI và EOI markers
-   - Verify bằng PIL Image
-
-4. CẢI TIẾN readCustomFrame():
-   - Hỗ trợ header size động (customHeaderSize)
-   - Có validation sau khi đọc
-=============================================================================
-"""
-
-from email import header
-import re
 import struct
 import os
 from PIL import Image
