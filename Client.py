@@ -1,34 +1,3 @@
-""" 
-=============================================================================
-Client.py - RTSP/RTP Video Streaming Client
-=============================================================================
-
-CÁC THAY ĐỔI SO VỚI PHIÊN BẢN TRƯỚC:
-
-1. ĐƠN GIẢN HÓA listenRtp():
-   - TRƯỚC: Sử dụng defaultdict để lưu packets theo timestamp/seqNum,
-            có logic sắp xếp lại packets, xử lý timeout, validate JPEG
-   - SAU:   Giả sử packets luôn đến đúng thứ tự và đầy đủ,
-            code đơn giản hơn ~50%
-
-2. LOẠI BỎ CÁC HÀM PHỨC TẠP:
-   - _tryAssembleFrame()     - ghép packet theo seqNum
-   - _processCompletedFrames() - xử lý frame timeout  
-   - _isValidJpeg()          - validate JPEG data
-
-3. THÊM PRE-BUFFERING:
-   - MIN_BUFFER_BEFORE_PLAY = 30 frames (0.5s) trước khi phát
-   - _waitAndStartPlayback() đợi buffer đủ
-
-4. TĂNG SOCKET BUFFER:
-   - SO_RCVBUF = 8MB để nhận burst data từ server
-
-5. ADAPTIVE FPS PLAYBACK:
-   - Giảm FPS khi buffer thấp
-   - Tạm dừng khi buffer critical
-=============================================================================
-"""
-
 from tkinter import *
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
@@ -56,7 +25,7 @@ class Client:
 	# CẤU HÌNH STREAMING - MỚI: Thêm các tham số điều khiển buffer và FPS
 	# ==========================================================================
 	TARGET_FPS = 60                    # FPS mục tiêu khi phát video
-	MAX_CACHE_FRAME_SIZE = 180         # MỚI: Buffer lớn hơn (3 giây ở 60fps)
+	MAX_CACHE_FRAME_SIZE = 400         # MỚI: Buffer lớn hơn (3 giây ở 60fps)
 	MIN_BUFFER_BEFORE_PLAY = 30        # MỚI: Pre-buffer 30 frames trước khi phát
 	LOW_BUFFER_THRESHOLD = 15          # MỚI: Giảm FPS khi buffer < 15
 	CRITICAL_BUFFER_THRESHOLD = 5      # MỚI: Tạm dừng khi buffer < 5
@@ -289,8 +258,7 @@ class Client:
 		# 			break
 
 	def _playbackLoop(self):
-		"""Adaptive playback from buffer - điều chỉnh FPS dựa trên mức buffer."""
-		base_fps = self.TARGET_FPS  # FPS mục tiêu (60)
+		base_fps = self.TARGET_FPS  # FPS mục tiêu (30)
 		frames_played = 0
 		start_time = time.time()
 		last_time = time.time()
@@ -299,24 +267,7 @@ class Client:
 
 		while not self.playbackStop.is_set():
 			buffer_level = len(self.playbackBuffer)
-			
-			# ====== ADAPTIVE FPS dựa trên buffer level ======
-			if buffer_level <= self.CRITICAL_BUFFER_THRESHOLD:
-				# Buffer quá thấp - tạm dừng chờ buffer
-				if buffer_level == 0:
-					print(f"[Playback] Buffer trống! Đang chờ...")
-					time.sleep(0.1)
-					continue
-				# Buffer critical - giảm xuống 30 FPS
-				current_fps = 30
-			elif buffer_level <= self.LOW_BUFFER_THRESHOLD:
-				# Buffer thấp - giảm xuống 45 FPS
-				current_fps = 45
-			else:
-				# Buffer đủ - chạy full FPS
-				current_fps = base_fps
-			
-			frame_interval = 1.0 / current_fps
+			frame_interval = 1.0 / base_fps
 			
 			# Đảm bảo timing chính xác
 			now = time.time()
@@ -336,7 +287,7 @@ class Client:
 					if frames_played % base_fps == 0:
 						actual_time = time.time() - start_time
 						actual_fps = frames_played / actual_time if actual_time > 0 else 0
-						print(f"[Playback] Frames: {frames_played}, Buffer: {buffer_level}, FPS thực tế: {actual_fps:.1f}, FPS hiện tại: {current_fps}")
+						print(f"[Playback] Frames: {frames_played}, Buffer: {buffer_level}, FPS thực tế: {actual_fps:.1f}, FPS hiện tại: {base_fps}")
 				except Exception as e:
 					print(f"Playback error: {e}")
 					

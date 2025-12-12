@@ -172,6 +172,64 @@ class ServerWorker:
             
             if 'rtpSocket' in self.clientInfo:
                 self.clientInfo['rtpSocket'].close()
+
+    def sendRtp(self):
+        MAX_RTP_PAYLOAD = 1400
+
+        fps = self.clientInfo['videoStream'].fps
+        FRAME_INTERVAL = 1.0 / fps
+        next_frame_time = time.time()
+        address = self.clientInfo['rtspSocket'][1][0]
+        port = int(self.clientInfo['rtpPort'])
+
+        print(f"[Server] Streaming at {fps} FPS...")
+
+        while True:
+        # pause or teardown
+            if self.clientInfo['event'].isSet(): 
+                break
+
+            now = time.time()
+            if now < next_frame_time:
+                time.sleep(next_frame_time - now)
+
+            next_frame_time += FRAME_INTERVAL
+            data = self.clientInfo['videoStream'].nextFrame()
+            if not data:
+                print("[Server] End of video.")
+                break
+
+            timestamp = self.clientInfo['videoStream'].frameNbr()
+            total_length = len(data)
+            current_index = 0
+
+            while current_index < total_length:
+                payload_length = min(MAX_RTP_PAYLOAD, total_length - current_index)
+                payload = data[current_index:current_index + payload_length]
+
+                marker = 1 if current_index + payload_length >= total_length else 0
+
+                self.seqnum += 1
+                packet = self.makeRtp(payload, self.seqnum, marker, timestamp)
+
+                self.clientInfo['rtpSocket'].sendto(packet, (address, port))
+
+                current_index += payload_length
+
+
+    def makeRtp(self, payload, seqnum, marker, timestamp):
+        """Hàm hỗ trợ đóng gói RTP với các tham số cần thiết cho Phân gói."""
+        version = 2
+        padding = 0
+        extension = 0
+        cc = 0
+        pt = 26
+        ssrc = 0
+		
+        rtpPacket = RtpPacket()
+        rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload, timestamp)
+		
+        return rtpPacket.getPacket()
     
     def sendBufferFrames(self):
         """Gửi frames để đổ đầy buffer của client."""
@@ -223,113 +281,6 @@ class ServerWorker:
             time.sleep(0.02)
         
         print(f"Buffer complete: {frames_sent} frames sent")
-    
-    def sendRtp(self):
-        """
-        Send RTP packets - BURST MODE AN TOÀN.
-        
-        THAY ĐỔI SO VỚI TRƯỚC:
-        - TRƯỚC: MAX_RTP_PAYLOAD = 1400, TARGET_FPS = 30, có pacing theo FPS
-        - SAU:   MAX_RTP_PAYLOAD = 8000 (ít packets hơn)
-                 MICRO_DELAY = 0.2ms (tránh mất gói)
-                 FRAME_DELAY = 2ms (cho client kịp xử lý)
-                 SO_SNDBUF = 8MB (buffer gửi lớn)
-        
-        Kết quả: Gửi 400 frames trong ~1-2 giây mà ít mất gói
-        
-        Cách điều chỉnh:
-        - Muốn nhanh hơn: Giảm MICRO_DELAY và FRAME_DELAY (rủi ro mất gói)
-        - Muốn an toàn hơn: Tăng MICRO_DELAY và FRAME_DELAY
-        """
-        # ==========================================================================
-        # CẤU HÌNH TỐI ƯU CHO BURST MODE - Gửi nhanh nhưng an toàn
-        # ==========================================================================
-        MAX_RTP_PAYLOAD = 8000      # MỚI: Tăng từ 1400 → ít packet hơn
-        MICRO_DELAY = 0.0002        # MỚI: 0.2ms delay giữa packets (tránh overflow)
-        FRAME_DELAY = 0.002         # MỚI: 2ms delay giữa frames
-        LOG_INTERVAL = 100          # Log mỗi 100 frames
-        
-        # Tăng send buffer của socket
-        self.clientInfo['rtpSocket'].setsockopt(
-            socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024  # 8MB buffer
-        )
-        
-        address = self.clientInfo['rtspSocket'][1][0]
-        port = int(self.clientInfo['rtpPort'])
-        
-        frames_sent = 0
-        total_bytes = 0
-        start_time = time.time()
-        
-        print(f"[Server] Burst streaming to {address}:{port}")
-        print(f"[Server] Payload: {MAX_RTP_PAYLOAD}, Micro-delay: {MICRO_DELAY*1000}ms")
-        
-        while True:
-            if self.clientInfo['event'].isSet():
-                break
-            
-            data = self.clientInfo['videoStream'].nextFrame()
-            
-            if not data:
-                elapsed = time.time() - start_time
-                fps = frames_sent / elapsed if elapsed > 0 else 0
-                print(f"[Server] Done! {frames_sent} frames in {elapsed:.2f}s = {fps:.0f} FPS")
-                print(f"[Server] Total data: {total_bytes / 1024 / 1024:.2f} MB")
-                break
-            
-            frameNumber = self.clientInfo['videoStream'].frameNbr()
-            timestamp = frameNumber
-            
-            current_index = 0
-            total_length = len(data)
-            total_bytes += total_length
-            
-            # Gửi tất cả packets của frame
-            while current_index < total_length:
-                payload_length = min(MAX_RTP_PAYLOAD, total_length - current_index)
-                payload = data[current_index:current_index + payload_length]
-                
-                marker_bit = 1 if current_index + payload_length >= total_length else 0
-                
-                self.seqnum += 1
-                packet = self.makeRtp(payload, self.seqnum, marker_bit, timestamp)
-                
-                try:
-                    self.clientInfo['rtpSocket'].sendto(packet, (address, port))
-                except Exception as e:
-                    print(f"[Server] Send error: {e}")
-                    return
-                
-                current_index += payload_length
-                
-                # Micro-delay giữa các packet (QUAN TRỌNG để tránh mất gói)
-                if marker_bit == 0:
-                    time.sleep(MICRO_DELAY)
-            
-            frames_sent += 1
-            
-            # Delay nhỏ giữa các frame
-            time.sleep(FRAME_DELAY)
-            
-            # Log tiến trình
-            if frames_sent % LOG_INTERVAL == 0:
-                elapsed = time.time() - start_time
-                fps = frames_sent / elapsed if elapsed > 0 else 0
-                print(f"[Server] Sent {frames_sent} frames, {fps:.0f} FPS, {total_bytes/1024/1024:.1f} MB")
-            
-    def makeRtp(self, payload, seqnum, marker, timestamp):
-        """Hàm hỗ trợ đóng gói RTP với các tham số cần thiết cho Phân gói."""
-        version = 2
-        padding = 0
-        extension = 0
-        cc = 0
-        pt = 26
-        ssrc = 0
-        
-        rtpPacket = RtpPacket()
-        rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload, timestamp)
-        
-        return rtpPacket.getPacket()
 
     def replyRtsp(self, code, seq):
         """Send RTSP reply to the client."""

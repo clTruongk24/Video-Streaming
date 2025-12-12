@@ -46,6 +46,7 @@ class VideoStream:
 		# JPEG Start of Image marker
 		self.SOI = b'\xFF\xD8'
 		self.format = self.detectFormat() # Xác định định dạng file
+		self.fps = 60  # Mặc định fps
 		print(f"VideoStream: Detected format = {self.format}")
 
 	def detectFormat(self):
