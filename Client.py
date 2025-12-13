@@ -20,7 +20,7 @@ class Client:
 	TEARDOWN = 3
 
 	# CẤU HÌNH STREAMING
-	TARGET_FPS = 20                    # FPS mục tiêu khi phát video
+	TARGET_FPS = 40                    # FPS mục tiêu khi phát video
 	MIN_BUFFER_BEFORE_PLAY = 30        # Pre-buffer 30 frames trước khi phát
 	MAX_BUFFER_SIZE = 300              # Buffer tối đa - tạm dừng nhận khi đạt
 	MIN_BUFFER_TO_RESUME = 100         # Buffer tối thiểu để tiếp tục nhận
@@ -47,6 +47,8 @@ class Client:
 		self.playbackStop = threading.Event()
 		self.playEvent = threading.Event()
 		self.bufferPaused = False  # Cờ tạm dừng nhận khi buffer đầy
+		self._playbackActive = False  # Cờ playback đang chạy
+		self._bufferPlaybackActive = False  # Cờ buffer playback đang chạy
 
 		
 	def createWidgets(self):
@@ -119,6 +121,10 @@ class Client:
 	def pauseMovie(self):
 		"""Pause button handler."""
 		if self.state == self.PLAYING:
+			# Dừng playback ngay lập tức
+			self._playbackActive = False
+			self._bufferPlaybackActive = False
+			
 			# Nếu đã nhận EOS (server đã dừng), chỉ cần dừng playback ở client
 			# Không cần gửi PAUSE request vì server đã không còn gửi data
 			if not self.eosReceived:
@@ -147,6 +153,7 @@ class Client:
 					print(f"[Client] Server đã hết video, phát {currentBuffer} frames còn trong buffer")
 					# Chuyển sang PLAYING để playback thread chạy
 					self.state = self.PLAYING
+					self.playEvent.clear()  # Cho phép playback chạy
 					if not hasattr(self, 'playbackThread') or not self.playbackThread.is_alive():
 						self.playbackThread = threading.Thread(target=self.playbackFromBuffer)
 						self.playbackThread.start()
@@ -155,30 +162,24 @@ class Client:
 					print(f"[Client] Video đã kết thúc, không còn frame nào trong buffer")
 				return  # KHÔNG gửi PLAY request khi đã EOS
 			
-			# Nếu buffer đủ -> phát ngay, không cần chờ thêm
-			if currentBuffer >= self.MIN_BUFFER_BEFORE_PLAY:
-				print(f"[Client] Buffer đủ ({currentBuffer} frames), bắt đầu phát...")
-				self.sendRtspRequest(self.PLAY)
-				if not hasattr(self, 'playbackThread') or not self.playbackThread.is_alive():
-					self.playbackThread = threading.Thread(target=self.playbackFromBuffer)
-					self.playbackThread.start()
-				return
-				
-			# Gửi PLAY request (chỉ khi chưa EOS)
+			# Gửi PLAY request - playback sẽ được xử lý bởi _playbackLoop trong listenRtp
 			self.sendRtspRequest(self.PLAY)
 			print(f"[Client] Đang chờ buffer đủ {self.MIN_BUFFER_BEFORE_PLAY} frames")
 	
 	def playbackFromBuffer(self):
-		"""Phát video từ buffer - dùng khi server đã hết video."""
-		base_fps = 30  # FPS khi phát từ buffer còn lại
+		"""PLAY VIDEO FROM BUFFER"""
+		base_fps = 30
 		frames_played = 0
+		frame_interval = 1.0 / base_fps
 		
-		print(f"[Playback from buffer] Bắt đầu phát ở {base_fps} FPS")
+		self._bufferPlaybackActive = True
 		
-		while self.state == self.PLAYING:
+		while self._bufferPlaybackActive and self.state == self.PLAYING and not self.playEvent.is_set():
+			start_time = time.time()
+			
 			with self.bufferLock:
 				bufferSize = len(self.playbackBuffer)
-				
+			
 			# Nếu buffer rỗng và đã nhận EOS -> kết thúc
 			if bufferSize == 0 and self.eosReceived:
 				print("[Client] Đã phát hết video")
@@ -194,18 +195,23 @@ class Client:
 			with self.bufferLock:
 				if self.playbackBuffer:
 					frame = self.playbackBuffer.popleft()
-					try:
-						imageFile = self.writeFrame(frame)
-						self.updateMovie(imageFile)
-						frames_played += 1
-						if frames_played % 30 == 0:
-							print(f"[Playback from buffer] Frames: {frames_played}, Buffer còn: {len(self.playbackBuffer)}")
-					except Exception as e:
-						print(f"[Playback error] {e}")
-					
-			time.sleep(1 / base_fps)
+			
+			try:
+				imageFile = self.writeFrame(frame)
+				self.updateMovie(imageFile)
+				frames_played += 1
+				if frames_played % 30 == 0:
+					print(f"[Playback from buffer] Frames: {frames_played}, Buffer còn: {len(self.playbackBuffer)}")
+			except Exception as e:
+				print(f"[Playback error] {e}")
+			
+			# Đảm bảo timing chính xác
+			elapsed = time.time() - start_time
+			if elapsed < frame_interval:
+				time.sleep(frame_interval - elapsed)
 		
 		print(f"[Playback from buffer] Đã phát {frames_played} frames")
+		self._bufferPlaybackActive = False
 
 	def listenRtp(self):		
 		"""Listen for RTP packets"""
@@ -297,7 +303,7 @@ class Client:
 					break
 	
 	def _waitAndStartPlayback(self):
-		"""Đợi buffer đủ rồi mới bắt đầu playback."""
+		"""Wait until buffer size reach MINIMUM SIZE BEFORE PLAY"""
 		print(f"[Client] Đang chờ buffer đủ {self.MIN_BUFFER_BEFORE_PLAY} frames...")
 		
 		# Đợi đến khi buffer đủ hoặc bị dừng
@@ -311,44 +317,57 @@ class Client:
 			self._playbackLoop()
 
 	def _playbackLoop(self):
-		base_fps = self.TARGET_FPS  # FPS mục tiêu (30)
-		frames_played = 0
-		start_time = time.time()
-		last_time = time.time()
+		"""Khởi động playback loop trên main thread."""
+		self._playbackFps = self.TARGET_FPS
+		self._playbackFramesPlayed = 0
+		self._playbackStartTime = time.time()
+		self._playbackActive = True
 		
-		print(f"[Playback] Bắt đầu phát ở {base_fps} FPS")
-
-		while not self.playbackStop.is_set() and not self.playEvent.is_set():
-			buffer_level = len(self.playbackBuffer)
-			frame_interval = 1.0 / base_fps
+		print(f"[Playback] Bắt đầu phát ở {self._playbackFps} FPS")
+		# Bắt đầu vòng lặp playback trên main thread
+		self.master.after(0, self._playbackTick)
+	
+	def _playbackTick(self):
+		"""Một tick của playback - chạy trên main thread."""
+		if not self._playbackActive:
+			return
 			
-			# Nếu buffer rỗng và đã EOS -> kết thúc playback
-			if buffer_level == 0 and self.eosReceived:
-				print(f"[Playback] Video kết thúc. Đã phát {frames_played} frames")
-				self.state = self.READY
-				break
-			
-			# Đảm bảo timing chính xác
-			now = time.time()
-			elapsed = now - last_time
-			if elapsed < frame_interval:
-				time.sleep(frame_interval - elapsed)
-			last_time = time.time()
+		# Kiểm tra điều kiện dừng
+		if self.playbackStop.is_set() or self.playEvent.is_set():
+			self._playbackActive = False
+			return
+		
+		buffer_level = len(self.playbackBuffer)
+		
+		# Nếu buffer rỗng và đã EOS -> kết thúc playback
+		if buffer_level == 0 and self.eosReceived:
+			print(f"[Playback] Video kết thúc. Đã phát {self._playbackFramesPlayed} frames")
+			self.state = self.READY
+			self._playbackActive = False
+			return
+		
+		# Nếu buffer rỗng nhưng chưa EOS -> chờ thêm data
+		if buffer_level == 0:
+			self.master.after(10, self._playbackTick)
+			return
 
-			if buffer_level > 0:
-				try:
-					frame = self.playbackBuffer.popleft()
-					imageFile = self.writeFrame(frame)
-					self.updateMovie(imageFile)
-					frames_played += 1
-					
-					# In thống kê mỗi giây
-					if frames_played % base_fps == 0:
-						actual_time = time.time() - start_time
-						actual_fps = frames_played / actual_time if actual_time > 0 else 0
-						#print(f"[Playback] Frames: {frames_played}, Buffer: {buffer_level}, FPS thực tế: {actual_fps:.1f}, FPS hiện tại: {base_fps}")
-				except Exception as e:
-					print(f"Playback error: {e}")
+		try:
+			frame = self.playbackBuffer.popleft()
+			imageFile = self.writeFrame(frame)
+			self.updateMovie(imageFile)  # Gọi trực tiếp vì đang ở main thread
+			self._playbackFramesPlayed += 1
+			
+			# In thống kê mỗi giây
+			if self._playbackFramesPlayed % self._playbackFps == 0:
+				actual_time = time.time() - self._playbackStartTime
+				actual_fps = self._playbackFramesPlayed / actual_time if actual_time > 0 else 0
+				print(f"[Playback] Frames: {self._playbackFramesPlayed}, Buffer: {buffer_level}, FPS thực tế: {actual_fps:.1f}")
+		except Exception as e:
+			print(f"Playback error: {e}")
+		
+		# Schedule tick tiếp theo
+		frame_interval_ms = int(1000 / self._playbackFps)
+		self.master.after(frame_interval_ms, self._playbackTick)
 					
 	def writeFrame(self, data):
 		"""Write the received frame to a temp image file. Return the image file."""
@@ -453,23 +472,63 @@ class Client:
 			return
 		
 		# Send the RTSP request using rtspSocket.
-		self.rtspSocket.send(request.encode("utf-8"))
-		
-		print('\nData sent:\n' + request)
+		try:
+			self.rtspSocket.send(request.encode("utf-8"))
+			print('\nData sent:\n' + request)
+		except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+			print(f"[Client] Không thể gửi request: {e}")
+			# Server đã ngắt kết nối
+			if requestCode == self.TEARDOWN:
+				# Nếu đang teardown thì coi như thành công
+				self.teardownAcked = 1
+			self._handleServerDisconnect()
 	
 	def recvRtspReply(self):
 		"""Receive RTSP reply from the server."""
 		while True:
-			reply = self.rtspSocket.recv(1024)
-			
-			if reply: 
-				self.parseRtspReply(reply.decode("utf-8"))
-			
-			# Close the RTSP socket upon requesting Teardown
-			if self.requestSent == self.TEARDOWN:
-				self.rtspSocket.shutdown(socket.SHUT_RDWR)
-				self.rtspSocket.close()
+			try:
+				reply = self.rtspSocket.recv(20480)
+				
+				if reply: 
+					self.parseRtspReply(reply.decode("utf-8"))
+				else:
+					# Server đóng kết nối (recv trả về empty)
+					print("[Client] Server đã đóng kết nối")
+					self._handleServerDisconnect()
+					break
+				
+				# Close the RTSP socket upon requesting Teardown
+				if self.requestSent == self.TEARDOWN:
+					self.rtspSocket.shutdown(socket.SHUT_RDWR)
+					self.rtspSocket.close()
+					break
+					
+			except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+				# Server ngắt kết nối đột ngột
+				print("[Client] Mất kết nối với server")
+				self._handleServerDisconnect()
 				break
+			except OSError as e:
+				# Socket đã đóng hoặc lỗi khác
+				if self.requestSent != self.TEARDOWN:
+					print(f"[Client] Lỗi kết nối: {e}")
+					self._handleServerDisconnect()
+				break
+	
+	def _handleServerDisconnect(self):
+		"""Xử lý khi mất kết nối với server."""
+		# Đánh dấu EOS để playback biết không còn data mới
+		self.eosReceived = True
+		
+		# Nếu còn frames trong buffer, tiếp tục phát
+		with self.bufferLock:
+			remaining = len(self.playbackBuffer)
+		
+		if remaining > 0:
+			print(f"[Client] Còn {remaining} frames trong buffer, tiếp tục phát...")
+		else:
+			print("[Client] Buffer rỗng, dừng video")
+			self.state = self.READY
 	
 	def parseRtspReply(self, data):
 		"""Parse the RTSP reply from the server."""
@@ -512,13 +571,6 @@ class Client:
 						self.teardownAcked = 1 
 	
 	def openRtpPort(self):
-		"""
-		Open RTP socket với buffer lớn để nhận burst data.
-		
-		THAY ĐỔI SO VỚI TRƯỚC:
-		- TRƯỚC: Không set SO_RCVBUF (mặc định ~8KB-64KB tùy OS)
-		- SAU:   SO_RCVBUF = 8MB để nhận burst data không mất gói
-		"""
 		self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		
 		# MỚI: Tăng receive buffer để nhận burst data từ server
